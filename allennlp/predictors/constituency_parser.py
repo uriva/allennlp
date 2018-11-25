@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Dict, Text
 
 from overrides import overrides
 from nltk import Tree
@@ -57,14 +57,15 @@ NODE_TYPE_TO_STYLE["RRC"] = ["color5"]
 NODE_TYPE_TO_STYLE["UCP"] = ["color5"]
 
 
-@Predictor.register('constituency-parser')
+@Predictor.register("constituency-parser")
 class ConstituencyParserPredictor(Predictor):
     """
     Predictor for the :class:`~allennlp.models.SpanConstituencyParser` model.
     """
+
     def __init__(self, model: Model, dataset_reader: DatasetReader) -> None:
         super().__init__(model, dataset_reader)
-        self._tokenizer = SpacyWordSplitter(language='en_core_web_sm', pos_tags=True)
+        self._tokenizer = SpacyWordSplitter(language="en_core_web_sm", pos_tags=True)
 
     def predict(self, sentence: str) -> JsonDict:
         """
@@ -77,7 +78,7 @@ class ConstituencyParserPredictor(Predictor):
         -------
         A dictionary representation of the constituency tree.
         """
-        return self.predict_json({"sentence" : sentence})
+        return self.predict_json({"sentence": sentence})
 
     @overrides
     def _json_to_instance(self, json_dict: JsonDict) -> Instance:
@@ -85,17 +86,24 @@ class ConstituencyParserPredictor(Predictor):
         Expects JSON that looks like ``{"sentence": "..."}``.
         """
         spacy_tokens = self._tokenizer.split_words(json_dict["sentence"])
+        original_tokens = tuple(token.text_with_ws for token in spacy_tokens)
         sentence_text = [token.text for token in spacy_tokens]
         pos_tags = [token.tag_ for token in spacy_tokens]
-        return self._dataset_reader.text_to_instance(sentence_text, pos_tags)
+        return (
+            self._dataset_reader.text_to_instance(sentence_text, pos_tags),
+            original_tokens,
+        )
 
     @overrides
-    def predict_instance(self, instance: Instance) -> JsonDict:
+    def predict_instance(self, instance_and_original_text: Instance) -> JsonDict:
+        instance, original_tokens = instance_and_original_text
         outputs = self._model.forward_on_instance(instance)
 
         # format the NLTK tree as a string on a single line.
         tree = outputs.pop("trees")
-        outputs["hierplane_tree"] = self._build_hierplane_tree(tree, 0, is_root=True)
+        outputs["hierplane_tree"] = self._build_hierplane_tree(
+            tree, original_tokens, [0], is_root=True
+        )
         outputs["trees"] = tree.pformat(margin=1000000)
         return sanitize(outputs)
 
@@ -105,12 +113,19 @@ class ConstituencyParserPredictor(Predictor):
         for output in outputs:
             # format the NLTK tree as a string on a single line.
             tree = output.pop("trees")
-            output["hierplane_tree"] = self._build_hierplane_tree(tree, 0, is_root=True)
+            output["hierplane_tree"] = self._build_hierplane_tree(
+                tree, [0], is_root=True
+            )
             output["trees"] = tree.pformat(margin=1000000)
         return sanitize(outputs)
 
-
-    def _build_hierplane_tree(self, tree: Tree, index: int, is_root: bool) -> JsonDict:
+    def _build_hierplane_tree(
+        self,
+        tree: Tree,
+        original_tokens: Dict[Text, Text],
+        offset: List[int],
+        is_root: bool,
+    ) -> JsonDict:
         """
         Recursively builds a JSON dictionary from an NLTK ``Tree`` suitable for
         rendering trees using the `Hierplane library<https://allenai.github.io/hierplane/>`.
@@ -129,33 +144,36 @@ class ConstituencyParserPredictor(Predictor):
         -------
         A JSON dictionary render-able by Hierplane for the given tree.
         """
+        begin_offset = offset[0]
         children = []
         for child in tree:
             if isinstance(child, Tree):
                 # If the child is a tree, it has children,
                 # as NLTK leaves are just strings.
-                children.append(self._build_hierplane_tree(child, index, is_root=False))
+                children.append(
+                    self._build_hierplane_tree(
+                        child, original_tokens, offset, is_root=False
+                    )
+                )
             else:
-                # We're at a leaf, so add the length of
-                # the word to the character index.
-                index += len(child)
+                offset[0] += 1
 
         label = tree.label()
-        span = " ".join(tree.leaves())
+        span = "".join(original_tokens[begin_offset : offset[0]])
         hierplane_node = {
-                "word": span,
-                "nodeType": label,
-                "attributes": [label],
-                "link": label
+            "word": span,
+            "nodeType": label,
+            "attributes": [label],
+            "link": label,
         }
         if children:
             hierplane_node["children"] = children
         # TODO(Mark): Figure out how to span highlighting to the leaves.
         if is_root:
             hierplane_node = {
-                    "linkNameToLabel": LINK_TO_LABEL,
-                    "nodeTypeToStyle": NODE_TYPE_TO_STYLE,
-                    "text": span,
-                    "root": hierplane_node
+                "linkNameToLabel": LINK_TO_LABEL,
+                "nodeTypeToStyle": NODE_TYPE_TO_STYLE,
+                "text": span,
+                "root": hierplane_node,
             }
         return hierplane_node
